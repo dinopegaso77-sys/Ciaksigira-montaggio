@@ -4,6 +4,7 @@ Azioni:
   montage     -> unisce clip/immagini con titoli, transizioni e musica, restituisce l'MP4
   lastframe   -> estrae l'ultimo fotogramma di una clip come JPEG
   mux         -> mette l'audio di una clip sul video di un'altra
+  voiceover   -> aggiunge una voce/audio a un video (audio originale abbassato, tenuto o tolto)
   presign_put -> link firmato per caricare un file nell'archivio R2 (dal telefono)
   urls        -> link firmati per leggere file dell'archivio
   list/delete -> elenco e cancellazione dei file
@@ -337,6 +338,32 @@ def mux(inp, tmp):
         return {"video_b64": base64.b64encode(f.read()).decode()}
 
 
+def voiceover(inp, tmp):
+    """Mette una voce (o un audio) su un video: inizio regolabile, volume della voce,
+    audio originale abbassato ('low'), tenuto ('keep') o tolto ('off'). Il video non viene ricodificato."""
+    v = fetch(inp["video"], os.path.join(tmp, "v.mp4"))
+    a = fetch(inp["audio"], os.path.join(tmp, "voice"))
+    start = max(0.0, float(inp.get("start", 0)))
+    vv = max(0.0, min(3.0, float(inp.get("voice_vol", 1.0))))
+    orig = inp.get("orig", "low")
+    dur = duration(v)
+    ms = int(start * 1000)
+    voice = f"[1:a]aresample=48000,aformat=channel_layouts=stereo,adelay={ms}|{ms},volume={vv:.2f}[vo]"
+    if orig != "off" and has_audio(v):
+        ov = 0.25 if orig == "low" else 1.0
+        fc = (voice + f";[0:a]aresample=48000,aformat=channel_layouts=stereo,volume={ov:.2f}[or];"
+              "[or][vo]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,apad[a]")
+    else:
+        fc = voice + ";[vo]apad[a]"  # audio lungo quanto il video
+    out = os.path.join(tmp, "vo.mp4")
+    run(["ffmpeg", "-y", "-i", v, "-i", a, "-filter_complex", fc, "-map", "0:v:0", "-map", "[a]",
+         "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-t", f"{dur:.3f}", "-movflags", "+faststart", out])
+    name = safe_name(inp.get("name") or "clip-con-voce") + ".mp4"
+    res = deliver(out, name, inp.get("folder", "ciak"))
+    res["duration"] = round(dur, 2)
+    return res
+
+
 def lastframe(inp, tmp):
     src = fetch(inp, os.path.join(tmp, "clip.mp4"))
     out = os.path.join(tmp, "last.jpg")
@@ -357,6 +384,8 @@ def handler(job):
             return lastframe(inp, tmp)
         if action == "mux":
             return mux(inp, tmp)
+        if action == "voiceover":
+            return voiceover(inp, tmp)
         if action == "ping":
             return {"ok": True, "r2": bool(r2()[0])}
         if action == "presign_put":
