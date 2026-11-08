@@ -8,7 +8,7 @@ RUN mkdir -p /fonts \
     && curl -fsSL -o /fonts/Kalam-Bold.ttf https://github.com/google/fonts/raw/main/ofl/kalam/Kalam-Bold.ttf \
     && curl -fsSL -o /fonts/BebasNeue-Regular.ttf https://github.com/google/fonts/raw/main/ofl/bebasneue/BebasNeue-Regular.ttf
 
-RUN pip install --no-cache-dir runpod requests pillow
+RUN pip install --no-cache-dir runpod requests pillow boto3
 
 WORKDIR /app
 COPY handler.py /app/handler.py

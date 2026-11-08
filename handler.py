@@ -1,10 +1,18 @@
 """Regista AI — worker RunPod per il montaggio (ffmpeg).
 
 Azioni:
-  montage   -> unisce le clip con titoli, transizioni e musica, restituisce l'MP4
-  lastframe -> estrae l'ultimo fotogramma di una clip come JPEG
+  montage     -> unisce clip/immagini con titoli, transizioni e musica, restituisce l'MP4
+  lastframe   -> estrae l'ultimo fotogramma di una clip come JPEG
+  mux         -> mette l'audio di una clip sul video di un'altra
+  presign_put -> link firmato per caricare un file nell'archivio R2 (dal telefono)
+  urls        -> link firmati per leggere file dell'archivio
+  list/delete -> elenco e cancellazione dei file
+  save_url    -> copia un file da un link (es. ciak RunPod) nell'archivio
+
+Archivio Cloudflare R2: variabili d'ambiente R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY (R2_BUCKET facoltativa).
 """
-import base64, json, os, shutil, subprocess, tempfile, uuid
+import base64, json, os, re, shutil, subprocess, tempfile, time, uuid
+from urllib.parse import urlparse
 import requests
 import runpod
 from PIL import Image, ImageDraw, ImageFont
@@ -32,9 +40,51 @@ def has_audio(path):
     return bool(json.loads(out).get("streams"))
 
 
+# ---------------- archivio R2 ----------------
+_S3 = None
+
+
+def r2():
+    """Client S3 per Cloudflare R2, o None se le variabili non sono impostate."""
+    global _S3
+    ep = os.environ.get("R2_ENDPOINT", "").strip()
+    if not ep or not os.environ.get("R2_ACCESS_KEY_ID") or not os.environ.get("R2_SECRET_ACCESS_KEY"):
+        return None, None
+    u = urlparse(ep if "://" in ep else "https://" + ep)
+    bucket = os.environ.get("R2_BUCKET", "").strip() or u.path.strip("/").split("/")[0] or "ciaksigira"
+    if _S3 is None:
+        import boto3
+        from botocore.config import Config
+        _S3 = boto3.client("s3", endpoint_url=f"{u.scheme}://{u.netloc}",
+                           aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"].strip(),
+                           aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"].strip(),
+                           region_name="auto", config=Config(signature_version="s3v4"))
+    return _S3, bucket
+
+
+def need_r2():
+    s3, b = r2()
+    if not s3:
+        raise RuntimeError("archivio R2 non configurato sull'endpoint")
+    return s3, b
+
+
+def get_url(key, expires=86400):
+    s3, b = need_r2()
+    return s3.generate_presigned_url("get_object", Params={"Bucket": b, "Key": key}, ExpiresIn=int(min(expires, 604800)))
+
+
+def safe_name(name):
+    base = re.sub(r"[^A-Za-z0-9._-]+", "-", name or "file").strip("-")[:80] or "file"
+    return base
+
+
 def fetch(src, dest):
-    """src: {'url': ...} oppure {'b64': ...}"""
-    if src.get("b64"):
+    """src: {'url': ...} | {'b64': ...} | {'key': ...} (file dell'archivio R2)"""
+    if src.get("key"):
+        s3, b = need_r2()
+        s3.download_file(b, src["key"], dest)
+    elif src.get("b64"):
         data = src["b64"].split(",", 1)[-1]
         with open(dest, "wb") as f:
             f.write(base64.b64decode(data))
@@ -152,12 +202,13 @@ def add_music(video, music, dst, vol, keep_audio):
          "-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", dst])
 
 
-def deliver(path, name):
-    """Con un bucket S3 configurato sull'endpoint restituisce un link, altrimenti il file in base64."""
-    if os.environ.get("BUCKET_ENDPOINT_URL"):
-        from runpod.serverless.utils import rp_upload
-        url = rp_upload.upload_file_to_bucket(name, path)
-        return {"url": url}
+def deliver(path, name, folder="film"):
+    """Con l'archivio R2 salva il file lì e restituisce chiave + link, altrimenti il file in base64."""
+    s3, b = r2()
+    if s3:
+        key = f"{folder}/{time.strftime('%Y%m%d-%H%M%S')}-{name}"
+        s3.upload_file(path, b, key, ExtraArgs={"ContentType": "video/mp4"})
+        return {"key": key, "url": get_url(key, 604800)}
     with open(path, "rb") as f:
         return {"video_b64": base64.b64encode(f.read()).decode()}
 
@@ -172,10 +223,14 @@ def montage(inp, tmp):
 
     norm = []
     for i, c in enumerate(clips):
-        raw = fetch(c, os.path.join(tmp, f"raw{i}.mp4"))
-        aud = fetch(c["audio"], os.path.join(tmp, f"aud{i}.mp4")) if c.get("audio") else None
         out = os.path.join(tmp, f"n{i}.mp4")
-        normalize(raw, out, w, h, keep, aud)
+        if c.get("image"):  # foto: diventa una clip con un lento zoom
+            img = fetch(c, os.path.join(tmp, f"img{i}"))
+            image_clip(img, out, w, h, float(c.get("duration") or 4))
+        else:
+            raw = fetch(c, os.path.join(tmp, f"raw{i}.mp4"))
+            aud = fetch(c["audio"], os.path.join(tmp, f"aud{i}.mp4")) if c.get("audio") else None
+            normalize(raw, out, w, h, keep, aud)
         norm.append(out)
 
     parts = []
@@ -202,8 +257,9 @@ def montage(inp, tmp):
         concat(parts, joined, tmp)
 
     final = joined
-    if inp.get("music_b64"):
-        mus = fetch({"b64": inp["music_b64"]}, os.path.join(tmp, "music." + inp.get("music_ext", "mp3")))
+    if inp.get("music_b64") or inp.get("music_key"):
+        msrc = {"key": inp["music_key"]} if inp.get("music_key") else {"b64": inp["music_b64"]}
+        mus = fetch(msrc, os.path.join(tmp, "music." + inp.get("music_ext", "mp3")))
         final = os.path.join(tmp, "final.mp4")
         add_music(joined, mus, final, float(inp.get("music_vol", 0.6)), keep)
 
@@ -212,6 +268,60 @@ def montage(inp, tmp):
     res = deliver(fast, f"film-{uuid.uuid4().hex[:8]}.mp4")
     res["duration"] = round(duration(fast), 2)
     return res
+
+
+def image_clip(img, dst, w, h, secs):
+    """Foto -> clip con zoom lento (effetto Ken Burns) e audio muto."""
+    frames = max(1, int(secs * FPS))
+    vf = (f"scale={w * 2}:{h * 2}:force_original_aspect_ratio=decrease,pad={w * 2}:{h * 2}:(ow-iw)/2:(oh-ih)/2:black,"
+          f"zoompan=z='min(zoom+0.0006,1.08)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={w}x{h}:fps={FPS},setsar=1,format=yuv420p")
+    run(["ffmpeg", "-y", "-i", img, "-f", "lavfi", "-t", str(secs), "-i", "anullsrc=r=48000:cl=stereo",
+         "-vf", vf, "-t", str(secs), "-map", "0:v", "-map", "1:a", *ENC, "-shortest", dst])
+
+
+# ---------------- azioni dell'archivio ----------------
+def presign_put(inp):
+    s3, b = need_r2()
+    folder = inp.get("folder", "libreria").strip("/") or "libreria"
+    key = f"{folder}/{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}-{safe_name(inp.get('name'))}"
+    ctype = inp.get("type") or "application/octet-stream"
+    put = s3.generate_presigned_url("put_object", Params={"Bucket": b, "Key": key, "ContentType": ctype}, ExpiresIn=3600)
+    return {"key": key, "put": put, "get": get_url(key)}
+
+
+def urls(inp):
+    exp = int(inp.get("expires", 86400))
+    return {"urls": {k: get_url(k, exp) for k in (inp.get("keys") or [])[:200]}}
+
+
+def list_files(inp):
+    s3, b = need_r2()
+    items, token = [], None
+    while True:
+        kw = {"Bucket": b, "Prefix": inp.get("prefix", "libreria/"), "MaxKeys": 1000}
+        if token:
+            kw["ContinuationToken"] = token
+        r = s3.list_objects_v2(**kw)
+        for o in r.get("Contents", []):
+            items.append({"key": o["Key"], "size": o["Size"], "modified": o["LastModified"].isoformat()})
+        if not r.get("IsTruncated"):
+            break
+        token = r.get("NextContinuationToken")
+    return {"items": items}
+
+
+def delete_file(inp):
+    s3, b = need_r2()
+    s3.delete_object(Bucket=b, Key=inp["key"])
+    return {"ok": True}
+
+
+def save_url(inp, tmp):
+    s3, b = need_r2()
+    path = fetch({"url": inp["url"]}, os.path.join(tmp, "dl"))
+    key = inp.get("key") or f"ciak/{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}.mp4"
+    s3.upload_file(path, b, key, ExtraArgs={"ContentType": inp.get("type", "video/mp4")})
+    return {"key": key}
 
 
 def mux(inp, tmp):
@@ -248,7 +358,17 @@ def handler(job):
         if action == "mux":
             return mux(inp, tmp)
         if action == "ping":
-            return {"ok": True}
+            return {"ok": True, "r2": bool(r2()[0])}
+        if action == "presign_put":
+            return presign_put(inp)
+        if action == "urls":
+            return urls(inp)
+        if action == "list":
+            return list_files(inp)
+        if action == "delete":
+            return delete_file(inp)
+        if action == "save_url":
+            return save_url(inp, tmp)
         return montage(inp, tmp)
     except Exception as e:
         return {"error": str(e)[:1000]}
