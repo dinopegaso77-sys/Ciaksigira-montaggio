@@ -1,4 +1,4 @@
-"""Regista AI — worker RunPod per il montaggio (ffmpeg).
+"""Ciak si gira — worker RunPod per il montaggio (ffmpeg).
 
 Azioni:
   montage     -> unisce clip/immagini con titoli, transizioni e musica, restituisce l'MP4
@@ -129,7 +129,7 @@ def card_png(text, w, h, path, small=False):
         d.text((w / 2, y + i * lh), l, font=f, fill=(251, 250, 245), anchor="mm")
     if not small:
         f2 = font(FONT_LABEL, int(fs * 0.32))
-        d.text((w / 2, y + (len(lines) - 1) * lh + fs * 1.1), "UN FILM REALIZZATO CON REGISTA AI", font=f2, fill=(161, 159, 152), anchor="mm")
+        d.text((w / 2, y + (len(lines) - 1) * lh + fs * 1.1), "UN FILM REALIZZATO CON CIAK SI GIRA", font=f2, fill=(161, 159, 152), anchor="mm")
     img.save(path)
 
 
