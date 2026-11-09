@@ -4,6 +4,7 @@ Azioni:
   montage     -> unisce clip/immagini con titoli, transizioni e musica, restituisce l'MP4
   lastframe   -> estrae l'ultimo fotogramma di una clip come JPEG
   mux         -> mette l'audio di una clip sul video di un'altra
+  render_timeline -> editor a tracce: video con transizioni per giunzione, testi, voci, musica
   voiceover   -> aggiunge una voce/audio a un video (audio originale abbassato, tenuto o tolto)
   presign_put -> link firmato per caricare un file nell'archivio R2 (dal telefono)
   urls        -> link firmati per leggere file dell'archivio
@@ -34,6 +35,15 @@ def run(cmd):
 def duration(path):
     out = run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", path])
     return float(json.loads(out)["format"]["duration"])
+
+
+def probe_size(path):
+    try:
+        out = run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "json", path])
+        s = json.loads(out)["streams"][0]
+        return int(s["width"]), int(s["height"])
+    except Exception:
+        return 0, 0
 
 
 def has_audio(path):
@@ -364,6 +374,171 @@ def voiceover(inp, tmp):
     return res
 
 
+# ---------------- editor a tracce ----------------
+XF = {"fade": "fade", "dissolve": "dissolve", "black": "fadeblack", "white": "fadewhite", "wipeleft": "wipeleft",
+      "wiperight": "wiperight", "slideleft": "slideleft", "slideright": "slideright", "circle": "circleopen",
+      "zoom": "zoomin", "pixel": "pixelize", "cut": "fade"}
+
+
+def enc_args(preview):
+    if preview:
+        return ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-pix_fmt", "yuv420p", "-r", str(FPS),
+                "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2"]
+    return ENC
+
+
+def card_still(text, dst, w, h, secs, small, enc):
+    png = dst + ".png"
+    card_png(text, w, h, png, small=small)
+    run(["ffmpeg", "-y", "-loop", "1", "-t", f"{secs:.3f}", "-i", png, "-f", "lavfi", "-t", f"{secs:.3f}", "-i", "anullsrc=r=48000:cl=stereo",
+         "-vf", f"fps={FPS},format=yuv420p", "-map", "0:v", "-map", "1:a", *enc, "-shortest", dst])
+
+
+def norm_item(src, dst, w, h, start, secs, vol, keep, enc, audio_src=None):
+    vf = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps={FPS}"
+    pre = ["-ss", f"{max(0, start):.3f}", "-t", f"{secs:.3f}"]
+    asrc = audio_src if (keep and audio_src and has_audio(audio_src)) else (src if keep and has_audio(src) else None)
+    if asrc:
+        a_in = ["-i", asrc] if asrc != src else []
+        a_map = "1:a:0" if asrc != src else "0:a:0"
+        af = f"volume={vol:.2f},apad,atrim=0:{secs:.3f}"
+        cmd = ["ffmpeg", "-y", *pre, "-i", src, *(["-ss", f"{max(0, start):.3f}", "-t", f"{secs:.3f}"] + a_in if a_in else []),
+               "-vf", vf, "-af", af, "-map", "0:v:0", "-map", a_map, *enc, "-t", f"{secs:.3f}", dst]
+    else:
+        cmd = ["ffmpeg", "-y", *pre, "-i", src, "-f", "lavfi", "-t", f"{secs:.3f}", "-i", "anullsrc=r=48000:cl=stereo",
+               "-vf", vf, "-map", "0:v:0", "-map", "1:a:0", *enc, "-t", f"{secs:.3f}", dst]
+    run(cmd)
+
+
+def esc_path(p):
+    return p.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+
+
+def render_timeline(inp, tmp):
+    W, H = int(inp.get("width", 1920)), int(inp.get("height", 1080))
+    preview = bool(inp.get("preview"))
+    if preview:  # anteprima veloce: lato lungo 854 px
+        k = 854 / max(W, H)
+        W, H = int(W * k) // 2 * 2, int(H * k) // 2 * 2
+    enc = enc_args(preview)
+    keep = bool(inp.get("clip_audio", True))
+    items = inp.get("video") or []
+    if not items:
+        raise ValueError("La traccia video è vuota")
+
+    parts, durs = [], []
+    for i, it in enumerate(items):
+        out = os.path.join(tmp, f"p{i}.mp4")
+        secs = max(0.2, float(it.get("dur") or 4))
+        if it.get("type") == "card":
+            card_still(it.get("text") or " ", out, W, H, secs, bool(it.get("small")), enc)
+        elif it.get("image"):
+            img = fetch(it["src"], os.path.join(tmp, f"img{i}"))
+            image_clip(img, out, W, H, secs)
+        else:
+            raw = fetch(it["src"], os.path.join(tmp, f"raw{i}.mp4"))
+            aud = fetch(it["audio"], os.path.join(tmp, f"aud{i}.mp4")) if it.get("audio") else None
+            norm_item(raw, out, W, H, float(it.get("in") or 0), secs, float(it.get("vol", 1)), keep, enc, aud)
+        parts.append(out); durs.append(duration(out))
+
+    # unione con una transizione per ogni giunzione
+    joined = os.path.join(tmp, "joined.mp4")
+    if len(parts) == 1:
+        shutil.copy(parts[0], joined)
+    else:
+        ins = []
+        for p in parts:
+            ins += ["-i", p]
+        fc, vl, al, off = [], "[0:v]", "[0:a]", 0.0
+        for i in range(1, len(parts)):
+            tr = items[i].get("trans") or {}
+            ttype = tr.get("type", "cut")
+            d = 0.04 if ttype == "cut" else float(tr.get("dur", 0.6))
+            d = max(0.04, min(d, durs[i - 1] - 0.05, durs[i] - 0.05))
+            off += durs[i - 1] - d
+            vo, ao = f"[v{i}]", f"[a{i}]"
+            fc.append(f"{vl}[{i}:v]xfade=transition={XF.get(ttype, 'fade')}:duration={d:.3f}:offset={off:.3f}{vo}")
+            fc.append(f"{al}[{i}:a]acrossfade=d={d:.3f}{ao}")
+            vl, al = vo, ao
+        run(["ffmpeg", "-y", *ins, "-filter_complex", ";".join(fc), "-map", vl, "-map", al, *enc, joined])
+    total = duration(joined)
+
+    # testi, voci e musica
+    texts = inp.get("texts") or []
+    auds = inp.get("audio") or []
+    final = joined
+    if texts or auds:
+        cmd = ["ffmpeg", "-y", "-i", joined]
+        fc = []
+        vchain = "[0:v]"
+        for j, t in enumerate(texts):
+            tf = os.path.join(tmp, f"t{j}.txt")
+            with open(tf, "w", encoding="utf-8") as f:
+                f.write(t.get("text") or "")
+            title = t.get("style") == "title"
+            fs = int(H * (0.085 if title else 0.055))
+            font = FONT_TITLE if title else "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+            if not os.path.exists(font):
+                font = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+            y = {"top": f"{int(H * 0.08)}", "center": "(h-text_h)/2"}.get(t.get("pos"), f"h-text_h-{int(H * 0.09)}")
+            s0, s1 = float(t.get("start", 0)), float(t.get("start", 0)) + float(t.get("dur", 3))
+            out = f"[vt{j}]"
+            fc.append(f"{vchain}drawtext=fontfile='{esc_path(font)}':textfile='{esc_path(tf)}':fontsize={fs}:fontcolor=white:"
+                      f"box=1:boxcolor=black@0.45:boxborderw={int(fs * 0.35)}:line_spacing={int(fs * 0.2)}:"
+                      f"x=(w-text_w)/2:y={y}:enable='between(t,{s0:.2f},{s1:.2f})'{out}")
+            vchain = out
+        voices, musics = [], []
+        for j, a in enumerate(auds):
+            path = fetch(a["src"], os.path.join(tmp, f"x{j}"))
+            cmd += (["-stream_loop", "-1"] if a.get("loop") else []) + ["-i", path]
+            idx = j + 1
+            st, ins_, du = float(a.get("start", 0)), float(a.get("in", 0)), float(a.get("dur", 5))
+            fi, fo = float(a.get("fin", 0)), float(a.get("fout", 0))
+            ch = f"[{idx}:a]atrim=start={ins_:.3f}:duration={du:.3f},asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo"
+            if fi > 0:
+                ch += f",afade=t=in:st=0:d={fi:.2f}"
+            if fo > 0:
+                ch += f",afade=t=out:st={max(0, du - fo):.2f}:d={fo:.2f}"
+            ms = int(st * 1000)
+            ch += f",volume={float(a.get('vol', 1)):.2f},adelay={ms}|{ms}[x{j}]"
+            fc.append(ch)
+            (voices if a.get("lane") == "voice" else musics).append(f"[x{j}]")
+        mix = ["[0:a]"]
+        if voices:
+            if len(voices) > 1:
+                fc.append(f"{''.join(voices)}amix=inputs={len(voices)}:duration=longest:normalize=0[vox]")
+            else:
+                fc.append(f"{voices[0]}anull[vox]")
+        if musics:
+            if len(musics) > 1:
+                fc.append(f"{''.join(musics)}amix=inputs={len(musics)}:duration=longest:normalize=0[mus]")
+            else:
+                fc.append(f"{musics[0]}anull[mus]")
+        if voices and musics and inp.get("duck", True):
+            fc.append("[vox]asplit=2[vox1][vox2]")
+            fc.append("[mus][vox2]sidechaincompress=threshold=0.03:ratio=10:attack=15:release=450[musd]")
+            mix += ["[vox1]", "[musd]"]
+        else:
+            if voices:
+                mix.append("[vox]")
+            if musics:
+                mix.append("[mus]")
+        fc.append(f"{''.join(mix)}amix=inputs={len(mix)}:duration=first:dropout_transition=0:normalize=0[aout]")
+        final = os.path.join(tmp, "final.mp4")
+        vmap = vchain if texts else "0:v"
+        venc = (enc[:enc.index("-c:a")] if texts else ["-c:v", "copy"])  # ricodifica il video solo se ci sono testi
+        cmd += ["-filter_complex", ";".join(fc), "-map", vmap, "-map", "[aout]", *venc,
+                "-c:a", "aac", "-b:a", "192k", "-t", f"{total:.3f}", final]
+        run(cmd)
+
+    fast = os.path.join(tmp, "film.mp4")
+    run(["ffmpeg", "-y", "-i", final, "-c", "copy", "-movflags", "+faststart", fast])
+    res = deliver(fast, ("anteprima" if preview else "film") + f"-{uuid.uuid4().hex[:8]}.mp4", "anteprima" if preview else "film")
+    res["duration"] = round(duration(fast), 2)
+    res["preview"] = preview
+    return res
+
+
 def lastframe(inp, tmp):
     src = fetch(inp, os.path.join(tmp, "clip.mp4"))
     out = os.path.join(tmp, "last.jpg")
@@ -373,6 +548,97 @@ def lastframe(inp, tmp):
         run(["ffmpeg", "-y", "-i", src, "-vf", "reverse,scale='min(1280,iw)':-2", "-frames:v", "1", "-q:v", "2", out])
     with open(out, "rb") as f:
         return {"image": "data:image/jpeg;base64," + base64.b64encode(f.read()).decode()}
+
+
+# ---------------- sottotitoli ----------------
+WHISPER = None
+
+
+def whisper_model():
+    global WHISPER
+    if WHISPER is None:
+        from faster_whisper import WhisperModel
+        WHISPER = WhisperModel(os.environ.get("WHISPER_MODEL", "small"), device="cpu", compute_type="int8",
+                               download_root="/models", cpu_threads=os.cpu_count() or 4)
+    return WHISPER
+
+
+def transcribe(inp, tmp):
+    """Trascrive l'audio del film con Whisper. translate=True -> traduce direttamente in inglese."""
+    src = fetch(inp["src"], os.path.join(tmp, "in.mp4"))
+    lang = (inp.get("lang") or "it")[:2]
+    if not has_audio(src):
+        return {"segments": [], "lang": lang, "note": "il film non ha audio"}
+    wav = os.path.join(tmp, "a.wav")
+    run(["ffmpeg", "-y", "-i", src, "-vn", "-ac", "1", "-ar", "16000", wav])
+    task = "translate" if inp.get("translate") else "transcribe"
+    segs, info = whisper_model().transcribe(wav, language=lang, task=task, vad_filter=True, beam_size=5)
+    out = [{"start": round(s.start, 2), "end": round(s.end, 2), "text": s.text.strip()} for s in segs if s.text.strip()]
+    return {"segments": out, "lang": lang, "task": task, "duration": round(info.duration, 2)}
+
+
+def srt_time(t):
+    t = max(0.0, float(t))
+    ms = int(round(t * 1000))
+    return f"{ms // 3600000:02d}:{ms // 60000 % 60:02d}:{ms // 1000 % 60:02d},{ms % 1000:03d}"
+
+
+def write_srt(segments, path):
+    n = 0
+    with open(path, "w", encoding="utf-8") as f:
+        for s in segments:
+            txt = (s.get("text") or "").strip()
+            if not txt:
+                continue
+            n += 1
+            f.write(f"{n}\n{srt_time(s['start'])} --> {srt_time(max(s['end'], s['start'] + 0.3))}\n{txt}\n\n")
+    return n
+
+
+ISO3 = {"it": "ita", "en": "eng", "fr": "fra", "es": "spa", "de": "deu"}
+
+
+def subtitle(inp, tmp):
+    """Aggiunge le tracce dei sottotitoli (selezionabili nel lettore) e, a scelta, ne scrive una nel video."""
+    src = fetch(inp["src"], os.path.join(tmp, "in.mp4"))
+    tracks = [t for t in (inp.get("tracks") or []) if t.get("segments")]
+    if not tracks:
+        raise ValueError("nessun sottotitolo da aggiungere")
+    files = []
+    for i, t in enumerate(tracks):
+        p = os.path.join(tmp, f"s{i}.srt")
+        if write_srt(t["segments"], p):
+            files.append((t.get("lang", "it")[:2], p))
+    if not files:
+        raise ValueError("i sottotitoli sono vuoti")
+    burn = inp.get("burn")
+    cmd = ["ffmpeg", "-y", "-i", src]
+    for _, p in files:
+        cmd += ["-i", p]
+    cmd += ["-map", "0:v:0", "-map", "0:a?"]
+    for i in range(len(files)):
+        cmd += ["-map", f"{i + 1}:0"]
+    bp = next((p for l, p in files if l == burn), None)
+    if bp:
+        h = probe_size(src)[1] or 720
+        fs = 18 if h >= 1000 else 16
+        style = (f"FontName=DejaVu Sans,FontSize={fs},Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
+                 f"BackColour=&H80000000,BorderStyle=3,Outline=1,Shadow=0,MarginV=22")
+        cmd += ["-vf", f"subtitles={bp}:charenc=UTF-8:force_style='{style}'",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"]
+    else:
+        cmd += ["-c:v", "copy"]
+    cmd += ["-c:a", "copy", "-c:s", "mov_text"]
+    for i, (l, _) in enumerate(files):
+        cmd += [f"-metadata:s:s:{i}", f"language={ISO3.get(l, l)}",
+                f"-metadata:s:s:{i}", f"title={'Italiano' if l == 'it' else 'English' if l == 'en' else l}"]
+    if files:
+        cmd += ["-disposition:s:0", "default"]
+    out = os.path.join(tmp, "sub.mp4")
+    run(cmd + ["-movflags", "+faststart", out])
+    res = deliver(out, safe_name(inp.get("name") or "film-sottotitolato") + ".mp4", "film")
+    res["duration"] = round(duration(out), 2)
+    return res
 
 
 def handler(job):
@@ -386,6 +652,12 @@ def handler(job):
             return mux(inp, tmp)
         if action == "voiceover":
             return voiceover(inp, tmp)
+        if action == "render_timeline":
+            return render_timeline(inp, tmp)
+        if action == "transcribe":
+            return transcribe(inp, tmp)
+        if action == "subtitle":
+            return subtitle(inp, tmp)
         if action == "ping":
             return {"ok": True, "r2": bool(r2()[0])}
         if action == "presign_put":
