@@ -641,6 +641,23 @@ def subtitle(inp, tmp):
     return res
 
 
+def pdf_text(inp, tmp):
+    """Estrae il testo da un PDF (copione / master del cortometraggio)."""
+    from pypdf import PdfReader
+    src = fetch(inp["src"], os.path.join(tmp, "doc.pdf"))
+    rd = PdfReader(src)
+    pages = []
+    for pg in rd.pages[:200]:
+        try:
+            pages.append((pg.extract_text() or "").strip())
+        except Exception:
+            pages.append("")
+    text = "\n\n".join(p for p in pages if p)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return {"text": text[:120000], "pages": len(rd.pages), "chars": len(text)}
+
+
 def handler(job):
     inp = job.get("input") or {}
     tmp = tempfile.mkdtemp()
@@ -654,6 +671,8 @@ def handler(job):
             return voiceover(inp, tmp)
         if action == "render_timeline":
             return render_timeline(inp, tmp)
+        if action == "pdf_text":
+            return pdf_text(inp, tmp)
         if action == "transcribe":
             return transcribe(inp, tmp)
         if action == "subtitle":

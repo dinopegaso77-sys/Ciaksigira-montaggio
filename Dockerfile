@@ -8,7 +8,7 @@ RUN mkdir -p /fonts \
     && curl -fsSL -o /fonts/Kalam-Bold.ttf https://github.com/google/fonts/raw/main/ofl/kalam/Kalam-Bold.ttf \
     && curl -fsSL -o /fonts/BebasNeue-Regular.ttf https://github.com/google/fonts/raw/main/ofl/bebasneue/BebasNeue-Regular.ttf
 
-RUN pip install --no-cache-dir runpod requests pillow boto3 faster-whisper
+RUN pip install --no-cache-dir runpod requests pillow boto3 faster-whisper pypdf
 
 # modello Whisper per i sottotitoli, scaricato una volta sola durante la build
 ENV WHISPER_MODEL=small
